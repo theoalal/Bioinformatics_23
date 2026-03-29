@@ -1,0 +1,1029 @@
+---
+title: "Virus_data_analysis_V3"
+author: "Theo"
+date: "2025-09-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(pheatmap)
+library(DESeq2)
+library(vegan)     # For community ecology analysis (alpha/beta diversity)
+library(ggpubr)    # For publication-ready plots
+library(viridis)
+library(RColorBrewer)
+library(ggrepel)
+library(colorspace)
+#library(EnhancedVolcano)
+```
+
+```{r}
+#######3## Data Pre-processing ##############
+# 1. Load and clean data
+kraken_data <- read_tsv("/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis/braken_data_all_samples.tsv")
+
+kraken_clean <- kraken_data %>%
+  mutate(
+    Species = ifelse(grepl("ricinus", Sample), "ricinus", "persulcatus"),
+    Sex = ifelse(grepl("\\-f\\-", Sample), "Female", 
+                ifelse(grepl("\\-m\\-", Sample), "Male", "Unknown")),
+    Sample_ID = str_extract(Sample, "ric-[fm]-\\d+|pers-[fm]-\\d+")
+  )
+
+# 2. Check data structure
+glimpse(kraken_clean)
+
+# 3. Filter for species-level data and aggregate
+species_data <- kraken_clean %>%
+  filter(Rank == "S") %>%
+  group_by(Sample_ID, Species, Sex, NCBI_TaxID, Scientific_Name) %>%
+  summarise(Total_Reads = sum(Reads_Count), .groups = "drop")
+
+# 4. Create the virus matrix - SLOW BUT RELIABLE METHOD
+# First, get all unique samples and viruses
+all_samples <- unique(species_data$Sample_ID)
+all_viruses <- unique(species_data$Scientific_Name)
+
+# Create an empty matrix
+virus_matrix <- matrix(0, nrow = length(all_samples), ncol = length(all_viruses))
+rownames(virus_matrix) <- all_samples
+colnames(virus_matrix) <- all_viruses
+
+# Fill the matrix manually
+for(i in 1:nrow(species_data)) {
+  sample <- species_data$Sample_ID[i]
+  virus <- species_data$Scientific_Name[i]
+  count <- species_data$Total_Reads[i]
+  virus_matrix[sample, virus] <- count
+}
+
+# Convert to data frame and add Sample_ID as a column
+virus_df <- as.data.frame(virus_matrix) %>%
+  rownames_to_column("Sample_ID")
+
+# 5. Save your results
+write_csv(kraken_clean, "/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis/viral_analysis/1000_reads_braken_clean_data.csv")
+write_csv(species_data, "/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis/viral_analysis/1000_reads_species_level_data.csv")
+write_csv(virus_df, "/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis/viral_analysis/1000_read_virus_abundance_matrix_df.csv")
+
+```
+
+
+
+
+## Goal 1 ###############
+#Panels
+#(A) Stacked barplot: relative abundance of top 10 viral taxa across samples, grouped by species.
+#(B) Barplot: top 10 most abundant viruses overall (mean relative abundance ± SD).
+#Purpose: Show composition and which viruses dominate across samples/species.
+
+#Inputs
+#virus_matrix.csv (counts)
+#metadata.tsv
+
+#Method
+#Convert counts → relative abundance per sample (percent)
+#Collapse low-abundance taxa into "Other" (e.g. sum of taxa <1% mean)
+#Order samples by species then by alpha diversity or sample ID
+
+```{r}
+# prep
+
+mat <- read.csv("/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis_metatranscriptomics/viral_analysis/1000_read_virus_abundance_matrix_df.csv", row.names=1, check.names=FALSE)
+meta <- read.csv("/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis_metatranscriptomics/viral_analysis/sample_metadata.csv")
+# long format and relative abundance
+long <- mat %>% rownames_to_column("Sample_ID") %>%
+  pivot_longer(-Sample_ID, names_to="Virus", values_to="Reads") %>%
+  left_join(meta, by="Sample_ID") %>%
+  group_by(Sample_ID) %>%
+  mutate(RelAb = 100 * Reads / sum(Reads)) %>% ungroup()
+```
+
+```{r}
+# subplot A: pick top 10 by mean rel abundance 
+# top10 viruses by mean relative abundance
+
+# ---- Select top 10 viruses by mean relative abundance ----
+top10 <- long %>%
+  group_by(Virus) %>%
+  summarise(meanRel = mean(RelAb, na.rm = TRUE)) %>%
+  arrange(desc(meanRel)) %>%
+  slice_head(n = 10) %>%
+  pull(Virus)
+
+# ---- Collapse others into "Other" and calculate total reads ----
+long_plot <- long %>%
+  mutate(Virus = if_else(Virus %in% top10, Virus, "Other")) %>%
+  group_by(Sample_ID) %>%
+  mutate(TotalReads = sum(RelAb, na.rm = TRUE)) %>%
+  ungroup()
+
+# ---- Set factor levels so "Other" is last ----
+virus_levels <- c(sort(unique(top10)), "Other")
+long_plot$Virus <- factor(long_plot$Virus, levels = virus_levels)
+
+# ---- Generate colors ----
+n_top <- length(top10)
+top_colors <- colorRampPalette(brewer.pal(8, "Paired"))(n_top)
+names(top_colors) <- top10
+
+fill_colors <- c(top_colors, Other = "grey70")
+
+# ---- Plot ----
+p <- ggplot(long_plot, aes(x = fct_reorder(Sample_ID, TotalReads),
+                           y = RelAb,
+                           fill = Virus)) +
+  geom_col() +
+  facet_grid(~Species, scales = "free_x", space = "free") +
+  theme_minimal() +
+  labs(y = "Relative abundance (%)",
+       x = "Sample (ordered by total abundance)") +
+  theme(axis.text.x = element_text(angle = 90,
+                                   vjust = 0.5,
+                                   hjust = 1)) +
+  scale_fill_manual(values = fill_colors)
+
+p
+
+ggsave("/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis/viral_analysis/top10_viruses_by_mean_relative_abundance.pdf",
+       plot = p,
+       width = 12,
+       height = 6,
+       dpi = 300)
+```
+
+
+```{r}
+###############################################################################
+
+# subplot B: barplot mean relative abundance
+summary <- long %>% group_by(Virus) %>% summarise(meanRel=mean(RelAb), sdRel=sd(RelAb)) %>%
+  arrange(desc(meanRel)) %>% slice_head(n=10)
+ggplot(summary, aes(x=reorder(Virus, meanRel), y=meanRel)) +
+  geom_col() + geom_errorbar(aes(ymin=meanRel-sdRel, ymax=meanRel+sdRel), width=.2) +
+  coord_flip() + theme_minimal() + labs(y="Mean relative abundance (%)")
+```
+```{r}
+ggsave("/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis_metatranscriptomics/viral_analysis/mean_relative_abundance_updated2.pdf",
+        width = 12,       # width in inches
+       height = 7,       # height in inches
+       dpi = 300)        # resolution in dots per inch
+```
+
+## Goal 2 ##########
+
+#########################################################################################################
+#Figure 2 — Prevalence vs mean abundance (bubble plot)
+#Panel
+#Bubble chart where x = prevalence (fraction of samples positive), y = mean relative abundance, bubble size = mean reads or mean abundance, color = viral family.
+#Purpose: Identify viruses that are both common (prevalent) and abundant.
+#Inputs
+#virus_matrix.csv
+#metadata.tsv
+#optional: virus_families.csv mapping scientific name → family
+#Method
+#Convert wide → long; compute per-virus prevalence and mean rel abundance
+#Prevalence = (# of samples with Reads > 0) / total samples
+#Optionally filter viruses with prevalence < 0.01 to declutter
+
+```{r pressure, echo=FALSE}
+long <- read.csv("/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis_metatranscriptomics/viral_analysis/1000_read_virus_abundance_matrix_df.csv", row.names=1, check.names=FALSE) %>%
+  rownames_to_column("Sample_ID") %>%
+  pivot_longer(-Sample_ID, names_to="Virus", values_to="Reads") %>%
+  left_join(read.csv("/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis_metatranscriptomics/viral_analysis/sample_metadata.csv"), by="Sample_ID")
+
+# numeric cleanup
+long$Reads <- as.numeric(long$Reads); long$Reads[is.na(long$Reads)] <- 0
+long <- long %>% group_by(Sample_ID) %>% mutate(RelAb=100*Reads/sum(Reads)) %>% ungroup()
+
+summary <- long %>% group_by(Virus) %>%
+  summarise(MeanRel = mean(RelAb), Prevalence = mean(Reads > 0), MeanReads = mean(Reads)) %>%
+  left_join(read.csv("/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis_metatranscriptomics/viral_analysis/viral_families.csv"), by=c("Virus"="Scientific_Name"))
+
+# bubble plot
+ggplot(summary, aes(x = Prevalence,
+                    y = MeanRel,
+                    size = MeanReads,
+                    color = Virus_Family)) +
+
+  geom_point(alpha = 0.8) +
+
+  geom_text_repel(aes(label = ifelse(Prevalence > 0.1 | MeanRel > 1, Virus, "")),
+                  size = 3,
+                  max.overlaps = Inf) +
+
+  scale_size(range = c(3, 12)) +
+
+  scale_color_viridis_d(option = "turbo") +   # many distinct colors
+
+  theme_minimal() +
+
+  labs(x = "Prevalence",
+       y = "Mean relative abundance (%)",
+       color = "Virus family",
+       size = "Mean reads")
+```
+
+```{r}
+
+```
+
+
+```{r}
+# Keep only viruses with non-zero mean relative abundance
+summary_nonzero <- summary %>%
+  filter(MeanRel > 0)
+
+ggplot(summary_nonzero, aes(x = Prevalence,
+                    y = MeanRel,
+                    size = MeanReads,
+                    color = Virus_Family)) +
+
+  geom_point(alpha = 0.8) +
+
+  geom_text_repel(aes(label = ifelse(Prevalence > 0.1 | MeanRel > 1, Virus, "")),
+                  size = 3,
+                  max.overlaps = Inf) +
+
+  scale_size(range = c(3, 12)) +
+
+  scale_color_viridis_d(option = "turbo") +   # many distinct colors
+
+  theme_minimal() +
+
+  labs(x = "Prevalence",
+       y = "Mean relative abundance (%)",
+       color = "Virus family",
+       size = "Mean reads")
+```
+
+```{r}
+ggsave("/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis/viral_analysis/mean_relative_abundance_prevalence.pdf",
+        width = 12,       # width in inches
+       height = 7,       # height in inches
+       dpi = 300)        # resolution in dots per inch
+```
+
+```{r}
+# Filter out zeros and add pseudocounts for log scale
+summary_nonzero <- summary %>%
+  filter(MeanRel > 0, Prevalence > 0) %>%
+  mutate(
+    MeanRel = MeanRel + 1e-6,
+    Prevalence = Prevalence + 1e-6
+  )
+
+# Generate as many distinct colors as families
+n_families <- length(unique(summary_nonzero$Virus_Family))
+family_palette <- qualitative_hcl(n_families, palette = "Dark3")
+
+ggplot(summary_nonzero, aes(x = Prevalence, y = MeanRel,
+                            size = MeanReads,
+                            color = Virus_Family)) +
+  geom_point(alpha = 0.8) +
+  ggrepel::geom_text_repel(
+    aes(label = ifelse(Prevalence > 0.1 | MeanRel > 1, Virus, "")),
+    size = 3, max.overlaps = 50
+  ) +
+  scale_size(range = c(3, 12)) +
+  scale_color_manual(values = family_palette) +
+  scale_y_log10() +
+  scale_x_log10() +
+  theme_minimal(base_size = 14) +
+  labs(x = "Prevalence [log10 scale]",
+       y = "Mean relative abundance (%) [log10 scale]",
+       color = "Virus Family",
+       size = "Mean Reads") +
+  guides(
+    color = guide_legend(ncol = 1, override.aes = list(size = 3)),
+    size = guide_legend(override.aes = list(color = "grey40"))
+  )
+```
+
+```{r}
+ggsave("/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis_metatranscriptomics/viral_analysis/relative_abundance_bubble_plot_byFamily.png",
+        width = 14,       # width in inches
+       height = 8,       # height in inches
+       dpi = 300)        # resolution in dots per inch
+```
+
+
+## Goal 3 ############
+
+##############################################################################################
+
+#Figure 3 — Heatmap of viral abundance (samples × viruses)
+#Panel
+#Heatmap (log2(count+1)) with samples as rows and top viruses as columns; sample annotation bars for species, sex.
+#Purpose: Visualize sample-level patterns and clusters.
+#Inputs
+#virus_matrix.csv
+#metadata.tsv
+
+#Method
+#Select top N viruses by total abundance (e.g., top 50)
+#Make numeric matrix, rownames = Sample_ID
+#Row annotation: species, sex (from metadata)
+#Scale rows or columns depending on interpretation (commonly scale rows to compare relative dominance per sample)
+```{r}
+
+mat <- read.csv("/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis_metatranscriptomics/viral_analysis/1000_read_virus_abundance_matrix_df.csv", row.names=1, check.names=FALSE)
+meta <- read.csv("/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis_metatranscriptomics/viral_analysis/sample_metadata.csv") %>% column_to_rownames("Sample_ID")
+
+# compute abundance per virus read
+virus_totals <- colSums(mat, na.rm = TRUE)
+
+
+#Select to 50 most abundant viral reads
+topN <- names(sort(virus_totals, decreasing = TRUE))[1:50]
+
+#for all 49 viruses:
+#topN <- names(sort(virus_totals, decreasing = TRUE))
+
+
+# keep only numeric columns, then convert to matrix
+mat_top <- mat[, topN, drop = FALSE] %>%     # keep as data.frame if single column
+  mutate(across(everything(), ~ as.numeric(.))) %>%
+  as.matrix()
+
+# optional: ensure rownames are preserved
+rownames(mat_top) <- rownames(mat)[rownames(mat_top)]
+
+# annotation
+ann <- meta[, c("Species","Sex")] 
+
+pheatmap(log2(mat_top+1), annotation_row=ann,
+         scale="row", clustering_method="complete",
+         filename="fig3_#heatmap.pdf", width=12, height=10)
+
+```
+
+##Heatmap modify
+```{r}
+library(pheatmap)
+library(RColorBrewer)
+
+mat_plot <- log2(mat_top + 1)
+mat_plot[mat_plot > 10] <- 10   # clamp to 0–10
+
+ann$Sex <- factor(ann$Sex, levels = c("male", "female"))
+ann <- ann[rownames(mat_plot), , drop=FALSE]
+
+ann_colors <- list(
+  Sex = c(male = "#1f78b4", female = "#e31a1c")
+)
+
+## --- Define color palette with plain color at zero ---
+breaks <- seq(0, 10, length.out = 101)
+cols <- colorRampPalette(c("white", "yellow", "orange", "red", "darkred"))(100)
+
+## --- Plot heatmap ---
+pheatmap(log2(mat_top + 1),
+         annotation_row = ann,
+         annotation_colors = ann_colors,
+         scale = "none",                  # important: do not rescale rows
+         clustering_method = "complete",
+         color = cols,
+         breaks = breaks,
+         filename = "fig3_1_heatmap.pdf",
+         width = 12,
+         height = 10)
+```
+
+# 4
+
+###############################################################################################################
+
+
+#Figure 4 — Differential abundance (species comparison)
+#Panels
+#Volcano plot of differential viruses (I. ricinus vs I. persulcatus)
+#Table inset or top hits barplot
+
+#Purpose:
+#Identify viruses significantly enriched in one tick species.
+
+#Inputs:
+#Raw counts matrix (no prior normalization)
+#metadata.tsv with Species factor
+
+#Method:
+#Use DESeq2 on counts matrix (or edgeR)
+#Filter low-count viruses (e.g., keep viruses with counts >= 10 in at least 3 samples)
+#Design formula: ~ Species (or ~ Species + Sex + Batch if you have covariates)
+#Adjusted p-value threshold: FDR < 0.05
+
+```{r}
+
+cts <- read.csv("/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis_metatranscriptomics/viral_analysis/1000_read_virus_abundance_matrix_df.csv", row.names=1, check.names=FALSE)
+meta <- read.csv("/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis_metatranscriptomics/viral_analysis/sample_metadata.csv") %>% column_to_rownames("Sample_ID")
+
+dim(cts)
+dim(meta)
+
+# transpose so that rows = viruses, cols = samples
+cts_t <- t(cts)
+dim(cts_t)
+# set proper names
+colnames(cts_t) <- rownames(meta)
+
+# ensure alignment
+stopifnot(all(colnames(cts_t) == rownames(meta)))
+
+# construct DESeq2 dataset
+dds <- DESeqDataSetFromMatrix(countData = round(cts_t),
+                              colData = meta,
+                              design = ~ Species)   # you can add + Sex if you want to adjust
+
+# -------------------------------------------------
+# Pre-filtering
+# -------------------------------------------------
+# remove viruses with very few reads across all samples
+dds <- estimateSizeFactors(dds, type = "poscounts")
+
+dds <- dds[rowSums(counts(dds)) > 1000, ]
+
+# -------------------------------------------------
+# Normalization & QC
+# -------------------------------------------------
+dds <- DESeq(dds)
+
+# Variance stabilizing transformation
+vsd <- varianceStabilizingTransformation(dds, blind = FALSE)
+
+# PCA plot
+plotPCA(vsd, intgroup = "Species") + ggtitle("PCA of Viral Communities")
+
+# Sample distance heatmap
+sampleDists <- dist(t(assay(vsd)))
+
+sample_sample_dist_heatmap <- pheatmap(as.matrix(sampleDists),
+         annotation_col = meta,
+         main = "Sample-to-sample distances")
+
+```
+
+```{r}
+pdf("/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis/viral_analysis/sample_sample_dist_heatmap.pdf",
+     width = 12, height = 8)
+print(sample_sample_dist_heatmap)
+dev.off()
+```
+
+
+
+```{r}
+
+# -------------------------------------------------
+# Differential abundance testing
+# -------------------------------------------------
+# Extract results for Species effect
+res <- results(dds, contrast = c("Species", "ricinus", "persulcatus"))
+
+# order by adjusted p-value
+res <- res[order(res$padj), ]
+
+# Save results
+write.csv(as.data.frame(res), "/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis_metatranscriptomics/viral_analysis/DESeq2_results_species.csv")
+
+# -------------------------------------------------
+# Visualization
+# -------------------------------------------------
+
+# MA plot
+plotMA(res, ylim = c(-4, 4))
+
+# Volcano plot
+EnhancedVolcano(res,
+                lab = rownames(res),
+                x = 'log2FoldChange',
+                y = 'padj',
+                pCutoff = 0.05,
+                FCcutoff = 1,
+                title = "Virus abundance differences between tick species",
+                subtitle = "DESeq2 results",
+                pointSize = 2.0,
+                labSize = 3.5)
+
+# Heatmap of top 20 differentially abundant viruses
+topVar <- head(order(rowVars(assay(vsd)), decreasing = TRUE), 20)
+Top_20_diff_heatmap <- pheatmap(assay(vsd)[topVar, ],
+         annotation_col = meta,
+         scale = "row",
+         show_rownames = TRUE,
+         clustering_method = "complete",
+         main = "Top 20 variable viruses")
+
+# -------------------------------------------------
+# Export normalized counts
+# -------------------------------------------------
+norm_counts <- counts(dds, normalized=TRUE)
+write.csv(as.data.frame(norm_counts), "/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis/viral_analysis/Normalized_counts.csv")
+```
+
+```{r}
+pdf("/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis/viral_analysis/Top_20_diff_Heatmap.pdf",
+    width = 12, height = 8)
+print(Top_20_diff_heatmap)
+dev.off()
+
+```
+
+#### Phase C: Advanced Statistical Analysis ##########
+
+1. Alpha Diversity: Within-sample diversity
+```{r}
+virus_matrix <- read.csv("/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis_metatranscriptomics/viral_analysis/virus_matrix_data_1000.csv", row.names=1, check.names=FALSE)
+
+meta <- read.csv("/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis_metatranscriptomics/viral_analysis/sample_metadata.csv") #%>% column_to_rownames("Sample_ID")
+```
+
+```{r}
+# Keep only viral count columns
+mat_clean <- virus_matrix %>%
+  as.data.frame() %>%
+  select(where(is.numeric))   # keep numeric columns only
+
+# bring back sample IDs as a column
+mat_clean <- mat_clean %>% rownames_to_column("Sample_ID")
+
+alpha_diversity <- mat_clean %>%
+  mutate(
+    Shannon = diversity(select(., -Sample_ID), index = "shannon"),
+    Simpson = diversity(select(., -Sample_ID), index = "simpson"),
+    Richness = rowSums(select(., -Sample_ID) > 0)
+  )
+
+alpha_diversity <- alpha_diversity %>%
+  left_join(
+    meta %>% select(Sample_ID, Species, Sex) %>% distinct(),
+    by = "Sample_ID"
+  )
+
+# Save the alpha diversity results
+write_csv(alpha_diversity, "/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis/viral_analysis/alpha_diversity_results.csv")
+
+# View the results
+head(alpha_diversity)
+```
+
+
+```{r}
+# Test for statistical differences
+shannon_model <- aov(Shannon ~ Species * Sex, data = alpha_diversity)
+summary(shannon_model)
+
+# Or use a non-parametric test if assumptions are violated
+#kruskal_wallace_test <- kruskal.test(Shannon ~ Species, data = alpha_diversity)
+#summary(kruskal_wallace_test)
+```
+           Df Sum Sq Mean Sq F value Pr(>F)  
+Species      1  0.852  0.8519   4.547 0.0357 *
+Sex          1  0.179  0.1795   0.958 0.3304  
+Species:Sex  1  0.356  0.3563   1.902 0.1713  
+Residuals   89 16.675  0.1874                 
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+
+
+
+```{r}
+# Plot the results
+P1 <- ggplot(alpha_diversity, aes(x = Species, y = Shannon, fill = Sex)) +
+  geom_boxplot() +
+  stat_compare_means(method = "kruskal.test", label = "p.format") +
+  labs(title = "Alpha Diversity by Species & Sex") +
+  theme_bw()
+print(P1)
+```
+
+```{r}
+# save the plot
+ggsave("/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis_metatranscriptomics/viral_analysis/Alpha_diversity_plot2.pdf",P1,
+  width  = 8,
+  height = 6,
+  units  = "in"
+)
+```
+
+#############################################################################
+2. Beta Diversity: Between-sample diversity
+```{r}
+# Perform PERMANOVA (adonis) to test if communities differ by species/sex
+# This uses Bray-Curtis dissimilarity
+# 1. Make sure Sample_ID is preserved
+mat_clean <- virus_matrix %>%
+  as.data.frame() %>%
+  rownames_to_column("Sample_ID")   # If IDs are in rownames
+
+# 2. Drop metadata (Species, Sex) if they are inside virus_matrix
+mat_clean <- mat_clean %>%
+  select(-matches("Species|Sex"))   # remove non-numeric metadata columns
+
+
+
+# Verify the dimensions match
+cat("After correction - Community matrix samples:", nrow(mat_clean), "\n")
+cat("After correction - Metadata samples:", nrow(meta), "\n")
+
+# They should now be equal
+```
+
+```{r}
+# PERMANOVA test
+# Ensure mat_clean has only numeric viral counts
+mat_numeric <- mat_clean %>%
+  select(-Sample_ID) %>%
+  as.matrix()
+
+# Match rownames to Sample_ID
+rownames(mat_numeric) <- mat_clean$Sample_ID
+
+# Make sure meta rows align
+meta <- meta %>%
+  filter(Sample_ID %in% rownames(mat_numeric)) %>%
+  arrange(match(Sample_ID, rownames(mat_numeric)))
+
+# Double-check alignment
+stopifnot(all(rownames(mat_numeric) == meta$Sample_ID))
+
+# Run PERMANOVA (Bray–Curtis distance)
+permanova_result <- adonis2(
+  mat_numeric ~ Species * Sex,
+  data = meta,
+  method = "bray",
+  permutations = 999
+)
+
+# Run PERMANOVA (Bray–Curtis distance)
+permanova_result_sex <- adonis2(
+  mat_numeric ~ Sex,
+  data = meta,
+  method = "bray",
+  permutations = 999)
+
+print(permanova_result_sex)
+
+# Run PERMANOVA (Bray–Curtis distance)
+permanova_result_Species <- adonis2(
+  mat_numeric ~ Species,
+  data = meta,
+  method = "bray",
+  permutations = 999)
+
+print(permanova_result_Species)
+
+# Save PERMANOVA results
+permanova_df <- as.data.frame(permanova_result) %>%
+  rownames_to_column("Term")
+write_csv(permanova_df, "/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis/viral_analysis/permanova_results.csv")
+```
+
+```{r}
+library(dplyr)
+library(tibble)
+# NMDS ordination
+# NMDS ordination - CORRECTED
+set.seed(123) # For reproducible results
+
+# Ensure community_matrix is numeric
+mat_numeric <- mat_clean %>%
+  mutate(across(everything(), as.numeric))
+
+# Create proper metadata
+#metadata_corrected <- kraken_clean %>%
+ # select(Sample_ID, Species, Sex) %>%
+  #distinct() %>%
+  #filter(Sample_ID %in% rownames(community_matrix_numeric)) %>%
+  #column_to_rownames("Sample_ID")
+
+mat_numeric <- mat_clean %>%
+  column_to_rownames("Sample_ID") %>%  # only if Sample_ID is a column
+  t() %>%
+  as.data.frame()
+
+# Now samples should be rows
+mat_numeric <- as.matrix(cts)
+
+# Check dimensions
+dim(mat_numeric)   # should be 92 x 49 (samples x viruses)
+
+
+# Align metadata
+meta <- meta %>%
+  filter(Sample_ID %in% rownames(mat_numeric)) %>%
+  arrange(match(Sample_ID, rownames(mat_numeric)))
+
+dim(meta)
+# Run NMDS
+# Bray-Curtis
+dist_mat <- vegdist(mat_numeric, method = "bray")
+nmds <- metaMDS(dist_mat, k = 2, trymax = 100)
+
+nmds_df <- scores(nmds) %>% as.data.frame()
+
+if (!"Sample_ID" %in% colnames(nmds_df)) {
+  nmds_df <- rownames_to_column(nmds_df, "Sample_ID")
+}
+
+meta_df <- meta
+
+if (!"Sample_ID" %in% colnames(meta_df)) {
+  meta_df <- rownames_to_column(meta_df, "Sample_ID")
+}
+
+nmds_scores <- left_join(nmds_df, meta_df, by = "Sample_ID")
+
+nrow(scores(nmds))
+# Extract NMDS scores (coordinates)
+
+
+
+# Save the results
+write_csv(nmds_scores, "/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis_metatranscriptomics/viral_analysis/nmds_scores.csv")
+
+# Check if it worked
+cat("NMDS completed successfully!\n")
+cat("Stress value:", nmds$stress, "\n")
+print(head(nmds_scores))
+```
+
+```{r}
+nmds_scores <- read.csv("/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis_metatranscriptomics/viral_analysis/nmds_scores.csv")
+
+# NMDS plot
+p2 <- ggplot(nmds_scores, aes(x = NMDS1, y = NMDS2, color = Sex, shape = Species)) +
+  geom_point(size = 3) +
+  stat_ellipse() +
+  theme_bw() +
+  labs(title = "NMDS of Viral Communities") # subtitle = paste("Stress:", round(nmds$stress, 3))
+print(p2)
+# Save plots
+ggsave("alpha_diversity_plot.png", P1, width = 8, height = 6)
+ggsave("nmds_plot.png", p2, width = 8, height = 6)
+
+#library(gridExtra)
+#combined_plot <- grid.arrange(P1, p2, ncol = 2)
+ggsave("/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis_metatranscriptomics/viral_analysis/nmds_combined2.pdf", p2, width = 10, height = 6, dpi = 300)
+message("Analysis complete! All results saved to CSV files.")
+```
+
+
+# Unmapped fastq_metrics
+```{r}
+df <- read_tsv("/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis_metatranscriptomics/viral_analysis/hisat2_ricinus_mapping_stats_summary.tsv")
+
+# Basic stats
+summary(df$Overall_Alignment_Rate)
+mean(df$Unmapped_Reads)
+# Plot
+ggplot(df, aes(x=reorder(Sample, Overall_Alignment_Rate), y=Overall_Alignment_Rate)) +
+  geom_col(fill="darkcyan") +
+  coord_flip() +
+  labs(y="Overall Alignment Rate (%)", x="Sample") +
+  theme_minimal(base_size=12)
+
+sum(df$Unmapped_Reads)
+summary(df$Unmapped_Reads)
+mean(df$Unmapped_Reads)
+
+```
+```{r}
+# Load packages
+library(tidyverse)
+library(ggthemes)
+
+# Read HISAT2 summary file
+stats <- read_tsv("/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis_metatranscriptomics/viral_analysis/hisat2_persul_mapping_summary.tsv")
+
+# Convert numeric columns
+stats <- stats %>%
+  mutate(across(c(Total_Reads, Aligned_Concordant_0, Aligned_Concordant_1,
+                  Aligned_Concordant_Multi, Aligned_Discordant_1,
+                  Unmapped_Reads, Overall_Alignment_Rate), as.numeric))
+
+# Calculate total mapped reads
+stats <- stats %>%
+  mutate(Mapped_Reads = Aligned_Concordant_1 + Aligned_Concordant_Multi + Aligned_Discordant_1)
+
+# Add species info from sample names
+stats <- stats %>%
+  mutate(Species = case_when(
+    grepl("pers", Sample, ignore.case = TRUE) ~ "I. persulcatus",
+    grepl("ric", Sample, ignore.case = TRUE) ~ "I. ricinus",
+    TRUE ~ "Unknown"
+  ))
+
+# ====== 1️⃣ Absolute counts (in millions) ======
+stats_long_counts <- stats %>%
+  select(Sample, Species, Mapped_Reads, Unmapped_Reads) %>%
+  pivot_longer(cols = c(Mapped_Reads, Unmapped_Reads),
+               names_to = "Category", values_to = "Reads")
+
+p1 <- ggplot(stats_long_counts, aes(x = reorder(Sample, -Reads), y = Reads / 1e6, fill = Category)) +
+  geom_bar(stat = "identity", position = "stack") +
+  facet_grid(~Species, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = c("Mapped_Reads" = "#0072B2", "Unmapped_Reads" = "#D55E00"),
+                    name = "Read Category",
+                    labels = c("tick Reads", "non-tick Reads")) +
+  labs(
+    title = "Persulcatus tick reads vs non-tick Reads per Sample",
+    x = "Sample ID",
+    y = "Read Count (Millions)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        panel.grid.major.x = element_blank())
+
+ggsave("/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis_metatranscriptomics/viral_analysis/mapped_vs_unmapped_reads_persulcatus.pdf", p1, width = 12, height = 6, dpi = 300)
+
+
+# ====== 2️⃣ Percent stacked bar plot ======
+stats_long_perc <- stats %>%
+  mutate(Mapped_Percent = (Mapped_Reads / Total_Reads) * 100,
+         Unmapped_Percent = (Unmapped_Reads / Total_Reads) * 100) %>%
+  select(Sample, Species, Mapped_Percent, Unmapped_Percent) %>%
+  pivot_longer(cols = c(Mapped_Percent, Unmapped_Percent),
+               names_to = "Category", values_to = "Percent")
+
+p2 <- ggplot(stats_long_perc, aes(x = reorder(Sample, -Percent), y = Percent, fill = Category)) +
+  geom_bar(stat = "identity", position = "stack") +
+  facet_grid(~Species, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = c("Mapped_Percent" = "#1f78b4", "Unmapped_Percent" = "#e31a1c"),
+                    name = "Read Category",
+                    labels = c("tick (%)", "non-tick (%)")) +
+  geom_text(aes(label = sprintf("%.1f%%", Percent)),
+            position = position_stack(vjust = 0.5),
+            color = "white", size = 2.8) +
+  labs(
+    title = "Percentage of persulcatus tick vs non-tick Reads per Sample",
+    x = "Sample ID",
+    y = "Percentage (%)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        panel.grid.major.x = element_blank())
+
+ggsave("/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis_metatranscriptomics/viral_analysis/mapped_vs_unmapped_reads_persulcatus_percent.pdf", p2, width = 12, height = 6, dpi = 300)
+
+# Print plots in interactive session
+p1
+p2
+
+```
+
+#
+
+##################################################################################################
+#Figure 5 — Novel virus discovery and phylogeny
+
+#1. Assemble Viral Reads
+#After extracting viral reads from Kraken2 or host-filtered datasets:
+#Tools: metaSPAdes (for metatranscriptomic/viral assembly)
+```{bash}
+#Assemble viral reads
+bash script
+
+
+#1. NCBI RefSeq Viral Protein Database (Recommended for DIAMOND/BLASTx)
+mkdir database
+cd database
+wget ftp://ftp.ncbi.nlm.nih.gov/refseq/release/viral/viral.1.protein.faa.gz
+
+gunzip viral.*.faa.gz
+cat viral.*.faa > viral_refseq.faa
+
+module load diamond
+diamond makedb --in viral_refseq.faa -d viral_refseq.dmnd
+
+```
+
+
+
+--------------------------------------------------------------------
+#2 Quality Filter and Remove Short/Low-Complexity Contigs
+Remove assemblies shorter than 300–500 bp
+```{bash}
+seqtk seq -L 500 contigs.fasta > contigs.500_plus.filt_persul.fasta
+```
+
+#3. Annotate Contigs to Identify Viral Genes
+Use Diamond blastx against viral protein databases (RefSeq Viral)
+
+```{bash}
+diamond blastx -d viral.dmnd -q contigs.500_plus.filt_persul.fasta \
+ -o contigs_viral.m8 -f 6 qseqid sseqid pident length evalue bitscore stitle \
+ --max-target-seqs 20 --evalue 1e-5 --threads 16
+ 
+# Test hit identity values/coverage percentage 
+ awk '{print $3}' contigs_viral.m8 | sort -n | uniq | head
+```
+
+#4. Extract RdRp Gene (or Other Marker Genes)
+The RNA-dependent RNA polymerase (RdRp) is the universal marker gene for RNA viruses.
+```{bash}
+#Search annotation file (m8) for RdRp-like hits
+#Extract matching contigs
+#Translate nucleotide contigs → protein sequences
+
+awk '$3 >= 80 && $5 == 0.0' contigs_viral.m8 | grep -i -E "rdrp|rna-dependent|polymerase" | cut -f1 |sort -u > persul_nairo_hit_rdrp_ids.txt
+
+#grep -i -E "rdrp|rna-dependent|polymerase" contigs_viral.m8 | awk '$3 >= 90 && #$11 == 0.00' | cut -f1 | sort -u > persul_nairo_rdrp_ids.txt
+
+seqtk subseq contigs.500_plus.filt_persul.fasta persul_nairo_hit_rdrp_ids.txt > persul_beiji_rdrp_contigs.fasta
+
+```
+
+
+
+# Finding ORFs using EMBOSS getorf
+# Extracting amino acid sequences
+# Filtering for RdRp or viral proteins
+# Preparing sequences for alignment and phylogeny
+
+```{bash}
+#5. Load EMBOSS on Puhti
+
+module load emboss
+
+#. Run getorf to find ORFs
+#You have assembled contigs (contigs.fasta).
+#You now extract all possible ORFs ≥300 nt (or ≥600 nt for viruses if needed).
+
+getorf -sequence combined_persul_contigs.fasta -outseq persul_viral_ORFs.faa -minsize 900
+  
+seqkit stats persul_viral_ORFs.faa
+
+#-minsize 900 → keeps ORFs ≥900 bp (≈100 aa), appropriate for RdRp detection
+#-find 3 → finds ORFs on all six frames
+#Output gives amino acid sequences directly (no nucleotide sequences)
+
+
+# Sanitize FASTA headers (Optional but recommended)
+sed -n 's/^>\([^ ]*\).* \([A-Za-z0-9_. -]*virus\).*/>\1_\2/p' full_reference_nt.fasta | sed 's/[ ()]/_/gI' > reference_short.fasta
+
+sed -n 's/.*protein_id=\([^]]*\).*/>\1_RdRp/p' nairoviridae_ref_prot.faa > nairoviridae_ref_prot_short.faa
+
+#This removes spaces and keeps only the ORF ID.
+```
+
+
+```{bash}
+
+#6. Identify RdRp or viral proteins using DIAMOND
+#Now annotate all ORFs and select only those matching viral proteins.
+
+diamond blastp \
+  -q un_nairo_contigs_orfs_clean.faa \
+  -d /scratch/project_2005863/metatranscriptomics_2025/Theo_analysis_metatranscriptomics/database/viral_refseq.dmnd \
+  -o un_nairo_orf_viral_hits.m8 \
+  -f 6 qseqid sseqid pident length evalue bitscore stitle \
+  --max-target-seqs 10 --evalue 1e-5 --threads 16
+
+
+# . Extract RdRp-positive ORFs
+grep -i -E "rdrp|rna-dependent|polymerase" un_nairo_orf_viral_hits.m8 | cut -f1 | sort -u > orf_rdrp_ids.txt
+
+#Extract only those ORFs:
+seqtk subseq un_nairo_contigs_orfs_clean.faa orf_rdrp_ids.txt > nairo_uncl_rdrp_orfs.faa
+
+#. Remove duplicates and very short sequences
+seqkit rmdup nairo_uncl_rdrp_orfs.faa > rdrp_orfs.unique.faa
+
+#Remove sequences <100 aa:
+seqkit seq -m 100 rdrp_orfs.unique.faa > rdrp_orfs.filtered.faa
+
+#Combine with reference RdRp sequences
+cat rdrp_orfs.filtered.faa ref_rdrp.faa > rdrp_plus_refs.faa
+```
+
+```{bash}
+#7. Align the protein sequences With MAFFT:
+mafft --auto --thread 8 rdrp_plus_refs.faa > rdrp_aligned.faa
+
+#Running alignment for multiple files
+for unaligned in *_Rdrp.faa; do mafft --maxiterate 1000 --localpair --thread 8 --leavegappyregion $unaligned > ${unaligned%_Rdrp.faa}_aligned.faa; done
+
+#Trim poorly aligned regions Using trimAl:
+trimal -automated1 \
+  -in rdrp_aligned.faa \
+  -out rdrp_aligned_trimmed.faa
+#Trimming with clipkit
+module load clipkit
+  clipkit Nairoviridae_aligned.faa -m gappy -g 0.5 -o Nairoviridae_aligned_trimmed.faa
+```
+
+```{bash}
+#10. Build phylogenetic tree Using IQ-TREE 2:
+module load iqtree
+iqtree2 -s rdrp_aligned_trimmed.faa \
+  -m MFP -bb 1000 -alrt 1000 -nt AUTO \
+  -pre rdrp_tree
+
+```
+

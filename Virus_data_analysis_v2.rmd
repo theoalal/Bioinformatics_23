@@ -1,0 +1,529 @@
+---
+title: "Metatranscriptomics_analysis"
+author: "Theo"
+date: "2025-08-28"
+output: html_document
+---
+#### Phase A: Import and inspect data ##########
+
+1. Load and Clean the Data in R
+```{r}
+# Load necessary libraries
+library(tidyverse) # For data manipulation and plotting
+library(vegan)     # For community ecology analysis (alpha/beta diversity)
+library(ggpubr)    # For publication-ready plots
+library(viridis)# For colorblind-friendly color scales
+#library(heatmap)
+```
+
+2. Import the data
+```{r}
+list.files()
+# Read the CSV file
+kraken_data <- read_tsv("/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis/braken_data_all_samples.tsv")
+problems(kraken_data)
+head(kraken_data)
+```
+
+3. Re-form the data
+```{r}
+# Clean the Sample names: Extract meaningful identifiers
+# This creates new columns for species (ricinus/persulcatus) and sex (f/m)
+kraken_clean <- kraken_data %>%
+  mutate(
+    # Extract species: "ricinus" or "persulcatus"
+    Species = ifelse(grepl("ricinus", Sample), "ricinus", "persulcatus"),
+    # Extract sex: "F" or "M" (assuming 'f' and 'm' in filename)
+    Sex = ifelse(grepl("\\-f\\-", Sample), "Female", 
+                ifelse(grepl("\\-m\\-", Sample), "Male", "Unknown")),
+    # Extract a simple sample ID (e.g., ric-f-10)
+    Sample_ID = str_extract(Sample, "ric-[fm]-\\d+|pers-[fm]-\\d+")
+  )
+
+# View the structure of your data
+glimpse(kraken_clean)
+head(kraken_clean)
+```
+
+
+4. Filter and Aggregate Data
+```{r}
+# Data 1: Analyze at the Species level (most common)
+species_data_1000 <- kraken_clean %>%
+  filter(Rank == "S") %>% # Keep only rows with Species-level assignments
+  group_by(Sample_ID, Species, Sex, NCBI_TaxID, Scientific_Name) %>%
+  summarise(Total_Reads = sum(Reads_Count), .groups = "drop")
+
+head(species_data_1000)
+
+write_csv(species_data_1000, "species_level_data_1000.csv")
+
+# Data 2: Create a prevalence table (Samples as rows, Viruses as columns)
+# This is essential for most downstream analyses
+virus_matrix_1000 <- species_data_1000 %>%
+  ungroup() %>%
+  select(Sample_ID, Species, Sex, Scientific_Name, Total_Reads) %>%
+  pivot_wider(
+    names_from = Scientific_Name, 
+    values_from = Total_Reads,
+    values_fn = list(Total_Reads = sum),  # Specify aggregation function
+    values_fill = 0
+  )
+
+# The virus_matrix is now ready for diversity and differential abundance analysis.
+head(virus_matrix_1000)
+
+write_csv(virus_matrix_1000, "virus_matrix_data_1000.csv")
+```
+
+#### Phase B: Exploratory Data Analysis (EDA) ##########
+
+5. Basic Summary Statistics
+```{r}
+# Total viral reads per sample
+total_reads_per_sample <- 
+  species_data_1000 %>%
+  group_by(Sample_ID, Species, Sex) %>%
+  summarise(Total_Reads = sum(Total_Reads), .groups = "drop")
+head(total_reads_per_sample)
+```
+
+```{r}
+# Number of different virus species per sample (Richness)
+richness_per_sample <- species_data_1000 %>%
+  group_by(Sample_ID, Species, Sex) %>%
+  summarise(Richness = n_distinct(Scientific_Name), .groups = "drop")
+
+
+```
+
+```{r}
+# Combine and plot
+summary_df <- total_reads_per_sample %>%
+  left_join(richness_per_sample, by = c("Sample_ID", "Species", "Sex"))
+
+readsPerSample <-
+  ggplot(summary_df, aes(x = Species, y = Total_Reads, fill = Sex)) +
+  geom_boxplot() +
+  scale_y_log10() + # Often needed due to large range in read counts
+  labs(title = "Total Viral Load by Tick Species and Sex",
+       y = "Total Reads (log10 scale)") +
+  theme_bw()
+
+RichnessPerSample <-
+  ggplot(summary_df, aes(x = Species, y = Richness, fill = Sex)) +
+  geom_boxplot() +
+  labs(title = "Viral Richness by Tick Species and Sex",
+       y = "Number of Virus Species") +
+  theme_bw()
+
+Plot1 <- ggpubr::ggarrange(readsPerSample, RichnessPerSample)
+
+# save the plot
+ggsave(plot = Plot1, "Viral_richness_byTick_plot_1000_reads.pdf",
+  width  = 10,
+  height = 5,
+  units  = "in"
+)
+```
+These plots will tell you if one tick species or sex has a higher viral load or carries more viruses
+
+
+
+6. Compositional Analysis: What viruses are there?
+```{r}
+# Calculate relative abundance of each virus in each sample
+relative_abundance <- species_data_1000 %>%
+  group_by(Sample_ID) %>%
+  mutate(Rel_Abund = (Total_Reads / sum(Total_Reads)) * 100) %>%
+  ungroup()
+
+
+```
+
+# This formula is wrong! Prevalence is wrong.
+```{r}
+# Find the most abundant viruses overall
+#library(tidyverse)
+
+# Summarize abundance & prevalence
+top_viruses_1000 <- relative_abundance %>%
+  group_by(Scientific_Name) %>%
+  summarise(
+    Mean_Abund = mean(Rel_Abund), 
+    Prevalence = n_distinct(Sample_ID[Total_Reads > 0]) / n_distinct(Sample_ID)
+  ) %>%
+  filter(Mean_Abund > 0.1 | Prevalence > 0.1) %>%
+  arrange(-Mean_Abund)
+```
+
+```{r}
+# Bubble plot
+ggplot(top_viruses_1000, aes(x = Prevalence, y = Mean_Abund, 
+                        size = Mean_Abund, color = Prevalence)) +
+  geom_point(alpha = 0.7) +
+  geom_text(aes(label = Scientific_Name), hjust = 1, vjust = 1, size = 2) +
+  scale_size(range = c(2, 7)) +
+  scale_color_viridis_c(option = "plasma") +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Virus Abundance vs Prevalence in Tick Metatranscriptomes",
+    x = "Prevalence (proportion of samples)",
+    y = "Mean Relative Abundance (%)",
+    size = "Mean Abundance",
+    color = "Virus Type"
+  )
+```
+```{r}
+virus_families <- data.frame(
+  Scientific_Name = c("Beiji nairovirus", "Fairhair virus", "Grotenhout virus", 
+                      "Ixovirus", "Ixovirus norvegiae", "Mikuni nairovirus",
+                      "Norwavirus", "Norwavirus grotenhoutense", "Norwavirus sp.",
+                      "Norway nairovirus 1", "Norway partiti-like virus 1",
+                      "Orthonairovirus", "Phlebovirus", "Pustyn virus",
+                      "Sara tick phlebovirus", "Sopafab virus", 
+                      "Yichun nairovirus", "unclassified Nairovirus",
+                      "unclassified Norwavirus", "unclassified Phlebovirus"),
+  Virus_Family = c("Nairovirus", "Nairovirus", "Norwavirus", 
+                   "Ixovirus", "Ixovirus", "Nairovirus",
+                   "Norwavirus", "Norwavirus", "Norwavirus",
+                   "Nairovirus", "Partiti-like", "Nairovirus",
+                   "Phlebovirus", "Phlebovirus", "Phlebovirus",
+                   "Sopafab", "Nairovirus", "Nairovirus",
+                   "Norwavirus", "Phlebovirus"))
+```
+
+```{r}
+top_viruses <- top_viruses_1000 %>%
+  left_join(virus_families, by = "Scientific_Name")
+```
+
+```{r}
+ggplot(top_viruses, aes(x = Scientific_Name, 
+                        y = Prevalence, 
+                        size = Mean_Abund, 
+                        color = Virus_Family)) +
+  geom_point(alpha = 0.7) +
+  scale_size(range = c(3, 15)) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "right") +
+  labs(title = "Virus Prevalence and Abundance by Family",
+       x = "Virus",
+       y = "Prevalence",
+       size = "Mean Abundance (%)",
+       color = "Virus Family")
+```
+###########################################################################
+### Computing abundance & prevalence #################################
+```{r}
+library(pheatmap)
+
+# Load data
+virus_data <- read.delim("braken_data_all_samples.tsv", sep="\t", header=TRUE)
+
+# ---- Abundance (relative abundance per sample) ----
+virus_abundance <- virus_data %>%
+  group_by(Sample_ID) %>%
+  mutate(Rel_Abundance = (Total_Reads / sum(Total_Reads)) * 100) %>%
+  ungroup()
+
+# ---- Prevalence (fraction of samples where detected) ----
+virus_prevalence <- virus_abundance %>%
+  group_by(Scientific_Name) %>%
+  summarise(
+    Mean_Abundance = mean(Rel_Abundance),
+    Prevalence = sum(Total_Reads > 0) / n_distinct(virus_abundance$Sample_ID)
+  )
+
+# ---- Save summary table ----
+write.table(virus_prevalence, "virus_abundance_prevalence_summary.tsv",
+            sep="\t", row.names=FALSE, quote=FALSE)
+
+# ---- Heatmap of relative abundance ----
+virus_matrix <- virus_abundance %>%
+  select(Sample_ID, Scientific_Name, Rel_Abundance) %>%
+  spread(Scientific_Name, Rel_Abundance, fill=0)
+
+rownames_mat <- virus_matrix$Sample_ID
+virus_matrix <- as.matrix(virus_matrix[,-1])
+rownames(virus_matrix) <- rownames_mat
+
+pheatmap(log10(virus_matrix+1),
+         cluster_rows=TRUE, cluster_cols=TRUE,
+         show_rownames=TRUE, show_colnames=TRUE,
+         fontsize=8,
+         main="Viral Abundance Heatmap (log10 scale)")
+
+# ---- Bubble plot (Prevalence vs Abundance) ----
+ggplot(virus_prevalence, aes(x=Scientific_Name, 
+                             y=Prevalence, 
+                             size=Mean_Abundance, 
+                             color=Scientific_Name)) +
+  geom_point(alpha=0.7) +
+  scale_size(range=c(3,12)) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle=45, hjust=1, size=8)) +
+  labs(title="Virus Prevalence and Abundance",
+       x="Virus", y="Prevalence",
+       size="Mean Abundance (%)",
+       color="Virus")
+
+```
+
+
+
+```{r}
+# Plot composition for top viruses
+plot_data <- relative_abundance %>%
+  filter(Scientific_Name %in% top_viruses$Scientific_Name)
+
+ggplot(plot_data, aes(x = Sample_ID, y = Rel_Abund, fill = Scientific_Name)) +
+  geom_col() +
+  facet_grid(~ Species + Sex, scales = "free_x", space = "free_x") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "Viral Community Composition",
+       y = "Relative Abundance (%)", x = "Sample") 
+# +
+#  scale_fill_viridis(discrete = TRUE) # Use a better color scale
+
+# save the plot
+ggsave("Viral_community_composition_plot.pdf")
+```
+
+#### Phase C: Advanced Statistical Analysis ##########
+
+1. Alpha Diversity: Within-sample diversity
+```{r}
+# Calculate diversity indices correctly
+alpha_diversity <-
+  virus_matrix %>%
+  as_data_frame() %>%
+  select(-Species, -Sex) %>%
+  column_to_rownames("Sample_ID") %>%  # Make Sample_ID the row names
+  mutate(across(everything(), as.numeric)) %>%  # Ensure all values are numeric
+  # Calculate diversity metrics
+  mutate(
+    Shannon = diversity(., index = "shannon"),
+    Simpson = diversity(., index = "simpson"),
+    Richness = rowSums(. > 0)  # Number of non-zero species
+  ) %>%
+  rownames_to_column("Sample_ID") %>%  # Bring Sample_ID back as a column
+  select(Sample_ID, Shannon, Simpson, Richness) %>%
+  # Add metadata
+  left_join(
+    kraken_clean %>% select(Sample_ID, Species, Sex) %>% distinct(),
+    by = "Sample_ID"
+  )
+
+# Save the alpha diversity results
+write_csv(alpha_diversity, "alpha_diversity_results.csv")
+
+# View the results
+head(alpha_diversity)
+```
+
+
+```{r}
+# Test for statistical differences
+shannon_model <- aov(Shannon ~ Species * Sex, data = alpha_diversity)
+summary(shannon_model)
+# Or use a non-parametric test if assumptions are violated
+
+# kruskal.test(Shannon ~ Species, data = alpha_diversity)
+```
+           Df Sum Sq Mean Sq F value Pr(>F)  
+Species      1  0.852  0.8519   4.547 0.0357 *
+Sex          1  0.179  0.1795   0.958 0.3304  
+Species:Sex  1  0.356  0.3563   1.902 0.1713  
+Residuals   89 16.675  0.1874                 
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+
+
+
+```{r}
+# Plot the results
+ggplot(alpha_diversity, aes(x = Species, y = Shannon, fill = Sex)) +
+  geom_boxplot() +
+  stat_compare_means(method = "kruskal.test", label = "p.format") +
+  labs(title = "Alpha Diversity (Shannon Index) by Species and Sex") +
+  theme_bw()
+```
+```{r}
+# save the plot
+ggsave(
+  here("/scratch/project_2005863/metatranscriptomics_2025/Theo_analysis/Alpha_diversity_by_species_sex_plot.pdf"
+  ),
+  width  = 7,
+  height = 5,
+  units  = "in"
+)
+```
+
+#############################################################################
+2. Beta Diversity: Between-sample diversity
+```{r}
+# Perform PERMANOVA (adonis) to test if communities differ by species/sex
+# This uses Bray-Curtis dissimilarity
+community_matrix <- virus_df %>%
+  column_to_rownames("Sample_ID") %>%
+  mutate(across(everything(), as.numeric))
+```
+
+```{r}
+metadata <- kraken_clean %>%
+  select(Sample_ID, Species, Sex) %>%
+  distinct() %>%  # Ensure no duplicates
+  filter(Sample_ID %in% rownames(community_matrix)) %>%  # Only keep samples that are in community matrix
+  column_to_rownames("Sample_ID")
+
+# Verify the dimensions match
+cat("After correction - Community matrix samples:", nrow(community_matrix), "\n")
+cat("After correction - Metadata samples:", nrow(metadata), "\n")
+
+# They should now be equal
+```
+
+```{r}
+# PERMANOVA test
+permanova_result <- adonis2(community_matrix ~ Species * Sex, 
+                           data = metadata, 
+                           method = "bray",
+                           permutations = 999)
+
+# Save PERMANOVA results
+permanova_df <- as.data.frame(permanova_result) %>%
+  rownames_to_column("Term")
+write_csv(permanova_df, "permanova_results.csv")
+```
+
+```{r}
+# NMDS ordination
+# NMDS ordination - CORRECTED
+set.seed(123) # For reproducible results
+
+# Ensure community_matrix is numeric
+community_matrix_numeric <- community_matrix %>%
+  mutate(across(everything(), as.numeric))
+
+# Create proper metadata
+metadata_corrected <- kraken_clean %>%
+  select(Sample_ID, Species, Sex) %>%
+  distinct() %>%
+  filter(Sample_ID %in% rownames(community_matrix_numeric)) %>%
+  column_to_rownames("Sample_ID")
+
+# Run NMDS
+nmds <- metaMDS(community_matrix_numeric, distance = "bray", k = 2, trymax = 100)
+
+# Get scores and join with CORRECTED metadata
+nmds_scores <- scores(nmds) %>% 
+  as.data.frame() %>% 
+  rownames_to_column("Sample_ID") %>% 
+  left_join(
+    metadata_corrected %>% rownames_to_column("Sample_ID"), 
+    by = "Sample_ID"
+  )
+
+# Save the results
+write_csv(nmds_scores, "nmds_scores_corrected.csv")
+
+# Check if it worked
+cat("NMDS completed successfully!\n")
+cat("Stress value:", nmds$stress, "\n")
+print(head(nmds_scores))
+```
+
+```{r}
+# 3. Save ALL your results
+results_list <- list(
+  kraken_clean = kraken_clean,
+  species_data = species_data,
+  virus_abundance = virus_df,
+  alpha_diversity = alpha_diversity,
+  permanova = permanova_df,
+  nmds = nmds_scores
+)
+
+# Save each result to CSV
+for(obj_name in names(results_list)) {
+  file_name <- paste0(obj_name, ".csv")
+  write_csv(results_list[[obj_name]], file_name)
+  message("Saved: ", file_name)
+}
+
+# 4. Create some basic plots and save them too
+# Alpha diversity plot
+p1 <- ggplot(alpha_diversity, aes(x = Species, y = Shannon, fill = Sex)) +
+  geom_boxplot() +
+  stat_compare_means(method = "kruskal.test", label = "p.format") +
+  labs(title = "Alpha Diversity (Shannon Index)") +
+  theme_bw()
+
+# NMDS plot
+p2 <- ggplot(nmds_scores, aes(x = NMDS1, y = NMDS2, color = Species, shape = Sex)) +
+  geom_point(size = 3) +
+  stat_ellipse() +
+  theme_bw() +
+  labs(title = "NMDS of Viral Communities", 
+       subtitle = paste("Stress:", round(nmds$stress, 3)))
+
+# Save plots
+ggsave("alpha_diversity_plot.png", p1, width = 8, height = 6)
+ggsave("nmds_plot.png", p2, width = 8, height = 6)
+
+message("Analysis complete! All results saved to CSV files.")
+```
+
+
+```
+This will show you if the overall viral community is different between I. ricinus and I. persulcatus.
+
+
+#3. Differential Abundance Analysis
+To find viruses that are significantly more abundant in one group than another, use DESeq2 (for raw counts) or ALDEx2 (for compositional data).
+
+```{r}
+# Example with DESeq2 (using raw counts from species_data)
+library(DESeq2)
+
+# Create a count matrix for DESeq2
+count_matrix <- species_data %>%
+  select(Sample_ID, Scientific_Name, Total_Reads) %>%
+  pivot_wider(names_from = Scientific_Name, values_from = Total_Reads, values_fill = 0) %>%
+  column_to_rownames("Sample_ID")
+
+# Create a metadata dataframe
+coldata <- alpha_diversity %>% select(Species, Sex) %>% rownames_to_column("Sample_ID") %>% column_to_rownames("Sample_ID")
+
+# Ensure order is the same
+count_matrix <- count_matrix[rownames(coldata), ]
+
+# Create DESeq2 object
+dds <- DESeqDataSetFromMatrix(countData = t(count_matrix),
+                              colData = coldata,
+                              design = ~ Species) # Test for effect of Species
+
+# Run analysis
+dds <- DESeq(dds)
+res <- results(dds, contrast = c("Species", "I. ricinus", "I. persulcatus"))
+res_df <- as.data.frame(res) %>% rownames_to_column("Virus") %>% arrange(padj)
+
+# View top differentially abundant viruses
+head(res_df %>% filter(padj < 0.05), 10)
+```
+
+
+Next Steps and Interpretation:
+Biological Questions: Frame your analysis around questions:
+
+"Does the virome of I. ricinus differ significantly from I. persulcatus?" (PERMANOVA, NMDS)
+
+"Which specific viruses are biomarkers for each tick species?" (DESeq2)
+
+"Is viral load or diversity affected by the sex of the tick?" (Alpha diversity plots, stats)
+
+Focus on Key Viruses: Identify the most interesting viruses from your results (e.g., pathogens like Severe acute respiratory syndrome-related coronavirus, Norway nairovirus 1, or highly abundant novel viruses).
+
+Validation: Consider validating key findings with PCR if these are important biological conclusions.
